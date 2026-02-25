@@ -148,6 +148,7 @@ from .model_patcher import (
     FluxTransfromerModelPatcher,
     Gemma2ModelPatcher,
     Gemma3LMModelPatcher,
+    Gemma3nImageEmbeddingsModelPatcher,
     Gemma3nLMModelPatcher,
     GptJModelPatcher,
     GptNeoModelPatcher,
@@ -4277,6 +4278,12 @@ class Gemma3nOpenVINOConfig(Gemma3OpenVINOConfig):
                 inputs_update={"token_type_ids": {0: "batch_size", 1: "sequence_length"}},
             )
         return super().with_behavior(behavior)
+
+    def patch_model_for_export(self, model: PreTrainedModel, model_kwargs: Optional[Dict[str, Any]] = None):
+        model_kwargs = model_kwargs or {}
+        if self._behavior == VLMConfigBehavior.VISION_EMBEDDINGS:
+            return Gemma3nImageEmbeddingsModelPatcher(self, model, model_kwargs)
+        return super().patch_model_for_export(model, model_kwargs)
 
 
 class DummyVisionPositionIdsInputGenerator(DummyVisionInputGenerator):

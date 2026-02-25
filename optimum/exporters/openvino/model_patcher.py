@@ -4829,6 +4829,54 @@ class Gemma3nLMModelPatcher(Gemma3LMModelPatcher):
             decoder_layer.mlp._gaussian_topk = decoder_layer.mlp._orig_gaussian_topk
 
 
+# Patched forward for MobileNetV5MultiScaleFusionAdapter (MSFA) used by the Gemma3n vision tower.
+# The original MSFA forward has data-dependent control flow that branches on tensor spatial
+# dimensions to choose between F.interpolate and F.avg_pool2d for resizing to output_resolution.
+# torch.jit.trace bakes only the path taken with dummy inputs, causing incorrect results when
+# actual inference images have different spatial dimensions.
+# This patch replaces the conditional resize with F.adaptive_avg_pool2d which:
+#   - accepts a constant output_size making it trace-friendly
+#   - is equivalent to avg_pool2d when input dims are evenly divisible by output dims
+#   - handles identity (no-op) when input dims == output dims
+# Adopted from timm.models.mobilenetv5.MobileNetV5MultiScaleFusionAdapter.forward
+def _gemma3n_msfa_forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+    high_resolution = inputs[0].shape[-2:]
+    resized_inputs = []
+    for img in inputs:
+        feat_size = img.shape[-2:]
+        if feat_size[0] < high_resolution[0] or feat_size[1] < high_resolution[1]:
+            img = F.interpolate(img, size=high_resolution, mode=self.interpolation_mode)
+        resized_inputs.append(img)
+
+    channel_cat_imgs = torch.cat(resized_inputs, dim=1)
+    img = self.ffn(channel_cat_imgs)
+
+    # Use adaptive_avg_pool2d instead of conditional avg_pool2d / interpolate.
+    # output_resolution is a constant tuple, so this is trace-friendly.
+    img = F.adaptive_avg_pool2d(img, self.output_resolution)
+
+    img = self.norm(img)
+    return img
+
+
+class Gemma3nImageEmbeddingsModelPatcher(CommonImageEmbeddingsModelPatcher):
+    def __enter__(self):
+        super().__enter__()
+        # Patch MSFA forward to be trace-friendly
+        vision_tower = self._model.model.vision_tower
+        timm_model = vision_tower.timm_model
+        if hasattr(timm_model, "msfa") and timm_model.msfa is not None:
+            timm_model.msfa._orig_forward = timm_model.msfa.forward
+            timm_model.msfa.forward = types.MethodType(_gemma3n_msfa_forward, timm_model.msfa)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        vision_tower = self._model.model.vision_tower
+        timm_model = vision_tower.timm_model
+        if hasattr(timm_model, "msfa") and timm_model.msfa is not None and hasattr(timm_model.msfa, "_orig_forward"):
+            timm_model.msfa.forward = timm_model.msfa._orig_forward
+
+
 class Idefics3ImageEmbeddingsModelPatcher(ModelPatcher):
     def __init__(
         self,
@@ -6360,8 +6408,8 @@ class Llama4TextModelPatcher(ModelPatcher):
         if is_transformers_version(">=", "4.56"):
             # openvino is not able to trace through the new chunked_overlay with left_padding
             self.original_chunked_overlay = transformers.masking_utils.chunked_overlay
-            transformers.masking_utils.chunked_overlay = (
-                lambda chunk_size, left_padding: transformers.masking_utils._legacy_chunked_overlay(chunk_size)
+            transformers.masking_utils.chunked_overlay = lambda chunk_size, left_padding: (
+                transformers.masking_utils._legacy_chunked_overlay(chunk_size)
             )
 
     def __exit__(self, exc_type, exc_value, traceback):
