@@ -301,7 +301,7 @@ class OVModelForCausalLMIntegrationTest(unittest.TestCase):
         if is_transformers_version(">=", str(Qwen3VLOpenVINOConfig.MIN_TRANSFORMERS_VERSION)):
             supported_architectures -= {"qwen3_vl_text"}
 
-        # qwen3_5_text a part of qwen3_5 architecture and is tested in seq2seq group
+        # qwen3_5_text is a part of qwen3_5 architecture and is tested in seq2seq group
         if is_transformers_version(">=", str(Qwen3_5TextOpenVINOConfig.MIN_TRANSFORMERS_VERSION)):
             supported_architectures -= {"qwen3_5_text"}
 
