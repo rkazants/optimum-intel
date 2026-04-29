@@ -5195,6 +5195,37 @@ def gemma4_eager_attention_forward_patched(
     return attn_output, attn_weights
 
 
+def gemma4_sdpa_attention_forward_patched(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    **kwargs,
+) -> tuple:
+    if scaling is None:
+        scaling = module.head_dim**-0.5
+
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    if attention_mask is not None:
+        attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+    attn_output = F.scaled_dot_product_attention(
+        query,
+        key_states,
+        value_states,
+        attn_mask=attention_mask,
+        dropout_p=dropout,
+        scale=scaling,
+    )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, None
+
+
 def gemma4_text_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -5245,7 +5276,7 @@ def gemma4_text_attention_forward(
                 past_key_values.shared_layers = {}
             past_key_values.shared_layers[self.layer_idx] = key_states, value_states
 
-    attention_interface = gemma4_eager_attention_forward_patched
+    attention_interface = gemma4_sdpa_attention_forward_patched
 
     attn_output, attn_weights = attention_interface(
         self,
