@@ -870,51 +870,16 @@ class NGramHashFunction(_OVOperationModule):
 
     @staticmethod
     def _convert(context, ngram_size, heads_per_ngram, multipliers, head_vocab_sizes, head_offsets, eos_token_id):
-        # The hash needs exact 63-bit integer math, but plugins execute i64 arithmetic in i32 (the CPU plugin lowers
-        # i64 to i32) and evaluate i32 Divide, FloorMod and comparisons through f32, which is exact only below 2^24.
-        # The decomposition below is therefore built from i32 operations that stay exact on the full i32 range:
-        # Add, Subtract, Multiply (without overflow), BitwiseXor, BitwiseAnd and BitwiseRightShift.
-        #   * every 64-bit value is kept as little-endian limbs of `limb_bits` bits,
-        #   * a product token * multiplier is computed limb by limb with carries (shift / mask),
-        #   * XOR is applied limb-wise,
-        #   * the remainder modulo p is accumulated with Horner steps `acc = (acc * 2^limb_bits + limb) % p`, where
-        #     the reduction of `acc < p * 2^limb_bits` is a sequence of branch-free conditional subtractions of
-        #     `p * 2^j`, j = limb_bits - 1 .. 0.
-        # The limb width keeps every intermediate value below 2^31: `p * 2^limb_bits <= 2^31`, limb products < 2^22.
-        from openvino.opset15 import bitwise_right_shift
-
-        if max(head_vocab_sizes) >= 2**30 or max(head_offsets) + max(head_vocab_sizes) >= 2**31:
-            raise ValueError("NGramHashFunction decomposition supports head vocabularies and table rows below 2^31")
-        limb_bits = min(11, 31 - max(head_vocab_sizes).bit_length())
-        limb_base = 1 << limb_bits
-        num_limbs = -(-64 // limb_bits)  # limbs of a 64-bit value
-        num_token_limbs = -(-31 // limb_bits)  # limbs of a non-negative i32 token id
-
-        def const_i32(value):
-            return ops.constant(np.array(value, dtype=np.int32))
-
-        def low_bits(x):
-            return ops.bitwise_and(x, const_i32(limb_base - 1))
-
-        def high_bits(x, shift=limb_bits):
-            return bitwise_right_shift(x, const_i32(shift))
-
-        def reduce_mod(x, modulus):
-            # x % modulus for 0 <= x < modulus * 2^limb_bits
-            for j in reversed(range(limb_bits)):
-                step = const_i32(modulus << j)
-                diff = ops.subtract(x, step)
-                negative = high_bits(diff, 31)  # -1 if diff < 0 else 0
-                x = ops.add(diff, ops.bitwise_and(step, negative))
-            return x
+        if max(o + s for o, s in zip(head_offsets, head_vocab_sizes)) > 2**31:
+            raise ValueError("NGramHashFunction supports table rows below 2^31")
 
         history_input = context.get_input(1)
-        token_ids = ops.convert(context.get_input(0), "i32")
-        history = ops.convert(history_input, "i32")
+        token_ids = ops.convert(context.get_input(0), "i64")
+        history = ops.convert(history_input, "i64")
         num_context = ngram_size - 1
         sequence = ops.concat([history, token_ids], 1)  # [N, c + L]
         seq_len = _dim(ops.shape_of(token_ids, "i64"), 1)
-        eos = const_i32(eos_token_id)
+        eos = _const_i64(eos_token_id)
         axis = _const_i64([1])
 
         def shifted(k):
@@ -931,38 +896,13 @@ class NGramHashFunction(_OVOperationModule):
             not_eos = ops.not_equal(token, eos)
             valid = not_eos if valid is None else ops.logical_and(valid, not_eos)
 
-        def product_limbs(token, multiplier):
-            # limbs of token * multiplier (exact, < 2^63 by the operation contract)
-            token_limbs = [low_bits(high_bits(token, limb_bits * j)) for j in range(num_token_limbs)]
-            multiplier_limbs = [(multiplier >> (limb_bits * i)) & (limb_base - 1) for i in range(num_limbs)]
-            limbs, carry = [], None
-            for c in range(num_limbs):
-                column = carry
-                for j in range(min(c + 1, num_token_limbs)):
-                    if multiplier_limbs[c - j]:
-                        term = ops.multiply(token_limbs[j], const_i32(multiplier_limbs[c - j]))
-                        column = term if column is None else ops.add(column, term)
-                if column is None:
-                    column = ops.multiply(token, const_i32(0))
-                limbs.append(low_bits(column))
-                carry = high_bits(column)
-            return limbs
-
         rows = []
-        mix = product_limbs(back[0], multipliers[0])
+        mix = ops.multiply(back[0], _const_i64(multipliers[0]))
         for order in range(2, ngram_size + 1):
-            term = product_limbs(back[order - 1], multipliers[order - 1])
-            mix = [ops.bitwise_xor(a, b) for a, b in zip(mix, term)]
-            for e in range(heads_per_ngram):
-                head = (order - 2) * heads_per_ngram + e
-                remainder = None
-                for limb in reversed(mix):
-                    remainder = (
-                        limb if remainder is None else ops.add(ops.multiply(remainder, const_i32(limb_base)), limb)
-                    )
-                    remainder = reduce_mod(remainder, head_vocab_sizes[head])
-                row = ops.add(remainder, const_i32(head_offsets[head]))
-                rows.append(ops.unsqueeze(row, _const_i64(-1)))
+            mix = ops.bitwise_xor(mix, ops.multiply(back[order - 1], _const_i64(multipliers[order - 1])))
+            heads = slice((order - 2) * heads_per_ngram, (order - 1) * heads_per_ngram)
+            remainder = ops.floor_mod(ops.unsqueeze(mix, _const_i64(-1)), _const_i64(head_vocab_sizes[heads]))
+            rows.append(ops.add(remainder, _const_i64(head_offsets[heads])))
         row_ids = ops.concat(rows, -1)  # [N, L, H]
         new_history = ops.slice(sequence, _const_i64([-num_context]), _const_i64([_I64_MAX]), _const_i64([1]), axis)
         flat = _const_i64([-1])
