@@ -56,6 +56,7 @@ from .configuration import (
     OVQuantizationMethod,
     OVWeightQuantizationConfig,
     _merge_ignored_scopes,
+    _TwoStageQuantizationConfig,
 )
 from .modeling import OVModelForFeatureExtraction, OVModelForMaskedLM, OVModelForZeroShotImageClassification
 from .modeling_base import OVBaseModel
@@ -1503,7 +1504,15 @@ class OVQuantizer(OptimumQuantizer):
                 config = config.clone()
                 config.num_samples = nncf_dataset.get_length()
 
-            if isinstance(config, OVWeightQuantizationConfig):
+            if isinstance(config, _TwoStageQuantizationConfig):
+                first_stage = config.first_stage.clone()
+                first_stage.num_samples = config.num_samples
+                quantized_model = _weight_only_quantization(ov_model, first_stage, nncf_dataset, **kwargs)
+                _make_node_names_unique(quantized_model)
+                quantized_model = _weight_only_quantization(
+                    quantized_model, config.second_stage, verify_not_optimized=False, **kwargs
+                )
+            elif isinstance(config, OVWeightQuantizationConfig):
                 if config.bits == 8:
                     # 8-bit weight only data-aware quantization is not supported
                     nncf_dataset = None
@@ -1735,6 +1744,24 @@ class OVQuantizer(OptimumQuantizer):
                 )
 
         return pipeline_quantization_config
+
+
+def _make_node_names_unique(model: openvino.Model):
+    """
+    In two-pass approaches for quantization, sometimes unnamed constant nodes might be duplicated in OpenVINO.
+    To avoid this, we rename these nodes by adding a suffix to their names.
+    """
+    names = {op.get_friendly_name() for op in model.get_ops()}
+    seen = set()
+    for op in model.get_ordered_ops():
+        name, index = op.get_friendly_name(), 0
+        while op.get_friendly_name() in seen:
+            index += 1
+            if f"{name}_{index}" in names:
+                continue
+            op.set_friendly_name(f"{name}_{index}")
+            names.add(op.get_friendly_name())
+        seen.add(op.get_friendly_name())
 
 
 def _weight_only_quantization(
