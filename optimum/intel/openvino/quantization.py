@@ -1747,6 +1747,10 @@ class OVQuantizer(OptimumQuantizer):
 
 
 def _make_node_names_unique(model: openvino.Model):
+    """
+    In two-pass approaches for quantization, sometimes unnamed constant nodes might be duplicated in OpenVINO.
+    To avoid this, we rename these nodes by adding a suffix to their names.
+    """
     names = {op.get_friendly_name() for op in model.get_ops()}
     seen = set()
     for op in model.get_ordered_ops():
