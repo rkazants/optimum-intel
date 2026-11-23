@@ -1753,9 +1753,10 @@ def _make_node_names_unique(model: openvino.Model):
         name, index = op.get_friendly_name(), 0
         while op.get_friendly_name() in seen:
             index += 1
-            if f"{name}_{index}" not in names:
-                op.set_friendly_name(f"{name}_{index}")
-                names.add(op.get_friendly_name())
+            if f"{name}_{index}" in names:
+                continue
+            op.set_friendly_name(f"{name}_{index}")
+            names.add(op.get_friendly_name())
         seen.add(op.get_friendly_name())
 
 
