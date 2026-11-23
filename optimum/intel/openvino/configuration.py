@@ -1913,11 +1913,12 @@ class _Qwen4QuantizationConfig(_TwoStageQuantizationConfig):
         "group_size": 64,
         "ratio": 1.0,
         "ignored_scope": {
-            "patterns": [".*hyper_connection.*", ".*self_attn\\..*", ".*linear_attn\\.in_proj_[ab]/.*"],
-            "names": [
-                f"__module.model.model.language_model.layers.{layer}.mlp.{proj}_proj/ov_ext::linear/MatMul"
-                for proj, layers in (("gate", (7, 18)), ("up", (5, 10, 19, 28)))
-                for layer in layers
+            "patterns": [
+                ".*hyper_connection.*",
+                ".*self_attn\\..*",
+                ".*linear_attn\\.in_proj_[ab]/.*",
+                ".*layers\\.(7|18)\\.mlp\\.gate_proj/.*",
+                ".*layers\\.(5|10|19|28)\\.mlp\\.up_proj/.*",
             ],
         },
     }
