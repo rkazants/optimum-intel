@@ -598,7 +598,6 @@ _DEFAULT_4BIT_WQ_CONFIGS = {
     },
     "Qwen/Qwen4-4B": {
         "quantization_configs": {
-            # Two-stage int4 + int8 compression, see `_Qwen4QuantizationConfig`
             "lm_model": {"config_class": "qwen4"},
         },
         "default_config": {"bits": 8, "sym": True, "weight_only": True},
@@ -1856,12 +1855,6 @@ class _GPTOSSQuantizationConfig(QuantizationConfigMixin):
 
 
 class _TwoStageQuantizationConfig(OVQuantizationConfigBase):
-    """
-    Two weight compression passes over the same model: the first stage keeps the layers of its `ignored_scope` in
-    original precision, the second stage compresses those to int8. Subclasses set `CONFIG_CLASS` and
-    `DEFAULT_FIRST_STAGE`.
-    """
-
     CONFIG_CLASS = None
     DEFAULT_FIRST_STAGE = None
     DEFAULT_SECOND_STAGE = {"bits": 8, "sym": False, "weight_only": True}
@@ -1914,8 +1907,6 @@ class _MiniCPMOCRQuantizationConfig(_TwoStageQuantizationConfig):
 class _Qwen4QuantizationConfig(_TwoStageQuantizationConfig):
     CONFIG_CLASS = "qwen4"
 
-    # First compression pass for the language model of Qwen/Qwen4-4B: int4 g64 for the MLP and the GDN projections;
-    # hyper-connections, attention, GDN in_proj_a/b and 6 sensitive MLP weights are quantized to int8 at the second
     DEFAULT_FIRST_STAGE = {
         "bits": 4,
         "sym": False,
@@ -1945,7 +1936,6 @@ def _quantization_config_from_dict(config_dict: Dict[str, Any]) -> OVQuantizatio
     if "quantization_configs" in config_dict:
         return OVPipelineQuantizationConfig.from_dict(config_dict)
 
-    # Check for two-stage quantization configs (MiniCPM-OCR, Qwen4)
     for config_cls in _TwoStageQuantizationConfig.__subclasses__():
         if config_dict.get("config_class") == config_cls.CONFIG_CLASS:
             return config_cls.from_dict(config_dict)

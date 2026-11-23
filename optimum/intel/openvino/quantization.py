@@ -1747,8 +1747,6 @@ class OVQuantizer(OptimumQuantizer):
 
 
 def _make_node_names_unique(model: openvino.Model):
-    # Constants added by a compression pass are auto-named and can reuse names of the loaded model, which the graph
-    # building of a following pass rejects
     names = {op.get_friendly_name() for op in model.get_ops()}
     seen = set()
     for op in model.get_ordered_ops():
