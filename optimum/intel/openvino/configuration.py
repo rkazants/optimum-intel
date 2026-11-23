@@ -566,6 +566,17 @@ _DEFAULT_4BIT_WQ_CONFIGS = {
             "vision_embeddings_model": {"bits": 8, "sym": True, "weight_only": True},
         },
     },
+    "Qwen/Qwen4-4B-Base": {
+        "quantization_configs": {
+            # Two-stage int4 + int8 compression, see `_Qwen4BaseQuantizationConfig`
+            "lm_model": {"config_class": "qwen4_base"},
+            "mtp_model": {"bits": 8, "sym": False, "weight_only": True},
+            "text_embeddings_model": {"bits": 8, "sym": False, "weight_only": True},
+            "vision_embeddings_model": {"bits": 8, "sym": False, "weight_only": True},
+            "vision_embeddings_merger_model": {"bits": 8, "sym": False, "weight_only": True},
+            "vision_embeddings_pos_model": {"bits": 8, "sym": False, "weight_only": True},
+        },
+    },
     "openbmb/MiniCPM-V-4.7-1B": {
         "bits": 4,
         "sym": False,
@@ -1599,6 +1610,8 @@ class OVConfig(BaseConfig):
             dtype = "_".join(dtypes)
         elif isinstance(quantization_config, _GPTOSSQuantizationConfig):
             dtype = "int4"
+        elif isinstance(quantization_config, _TwoStageWeightQuantizationConfig):
+            dtype = quantization_config.first_stage.dtype
         else:
             raise ValueError(f"Unsupported type of quantization config: {type(quantization_config)}")
         return dtype
@@ -1838,6 +1851,82 @@ class _GPTOSSQuantizationConfig(QuantizationConfigMixin):
         return result
 
 
+class _TwoStageWeightQuantizationConfig(OVQuantizationConfigBase):
+    """
+    Two weight compression passes over the same model. The first stage typically compresses to 4 bits with an
+    `ignored_scope` that keeps chosen layers in their original precision; the second stage (8-bit weight-only by
+    default) then compresses only what the first stage left uncompressed, since already compressed weights are no
+    longer seen as weights. This selects 4 or 8 bits per layer with NNCF versions that have no scoped configs.
+
+    Model-specific subclasses set `CONFIG_CLASS` and their `DEFAULT_FIRST_STAGE` / `DEFAULT_SECOND_STAGE`; this base
+    class (`config_class: "two_stage"`) takes both stages explicitly.
+    """
+
+    CONFIG_CLASS = "two_stage"
+    DEFAULT_FIRST_STAGE: Optional[Dict[str, Any]] = None
+    DEFAULT_SECOND_STAGE: Dict[str, Any] = {"bits": 8, "sym": False, "weight_only": True}
+
+    def __init__(
+        self,
+        first_stage: Optional[Union[Dict, OVWeightQuantizationConfig]] = None,
+        second_stage: Optional[Union[Dict, OVWeightQuantizationConfig]] = None,
+        **kwargs,
+    ):
+        kwargs.pop("config_class", None)
+        first_stage = self.DEFAULT_FIRST_STAGE if first_stage is None else first_stage
+        second_stage = self.DEFAULT_SECOND_STAGE if second_stage is None else second_stage
+        if first_stage is None:
+            raise ValueError(f"`first_stage` is required for `config_class: {self.CONFIG_CLASS}`.")
+        if isinstance(first_stage, dict):
+            first_stage = OVWeightQuantizationConfig.from_dict(copy.deepcopy(first_stage))
+        if isinstance(second_stage, dict):
+            second_stage = OVWeightQuantizationConfig.from_dict(copy.deepcopy(second_stage))
+        self.first_stage, self.second_stage = first_stage, second_stage
+        # Calibration data related parameters are taken from the first stage
+        for field in ("dataset", "num_samples", "tokenizer", "processor", "_dataset_kwargs"):
+            kwargs.setdefault(field, getattr(self.first_stage, field))
+        super().__init__(**kwargs)
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = super().to_dict()
+        result["config_class"] = self.CONFIG_CLASS
+        result["first_stage"] = self.first_stage.to_dict()
+        result["second_stage"] = self.second_stage.to_dict()
+        return result
+
+
+class _Qwen4BaseQuantizationConfig(_TwoStageWeightQuantizationConfig):
+    """
+    Two-pass weight compression config for the language model of Qwen4-4B-Base (dense MLP + Qwen Sparse Attention,
+    4-branch hyper-connections). Data-free: INT4_ASYM g64 for the MLP and the GDN `in_proj_qkv` / `in_proj_z` /
+    `out_proj`; INT8_ASYM per-channel for the hyper-connection gates, all QSA attention projections (incl. the
+    indexer), the GDN `in_proj_a` / `in_proj_b` and 6 MLP weights that NNCF's Hessian mixed precision ranks as
+    sensitive. Measured: 3.79 GiB, WWB similarity 0.910 vs the uncompressed model.
+    """
+
+    CONFIG_CLASS = "qwen4_base"
+    DEFAULT_FIRST_STAGE = {
+        "bits": 4,
+        "sym": False,
+        "group_size": 64,
+        "ratio": 1.0,
+        # kept in original precision at the first stage and quantized to int8_asym at the second
+        "ignored_scope": {
+            "patterns": [".*hyper_connection.*", ".*self_attn\\..*", ".*linear_attn\\.in_proj_[ab]/.*"],
+            "names": [
+                f"__module.model.model.language_model.layers.{layer}.mlp.{proj}_proj/ov_ext::linear/MatMul"
+                for proj, layers in (("gate", (7, 18)), ("up", (5, 10, 19, 28)))
+                for layer in layers
+            ],
+        },
+    }
+
+
+_TWO_STAGE_CONFIG_CLASSES = {
+    cls.CONFIG_CLASS: cls for cls in (_TwoStageWeightQuantizationConfig, _Qwen4BaseQuantizationConfig)
+}
+
+
 def _quantization_config_from_dict(config_dict: Dict[str, Any]) -> OVQuantizationConfigBase:
     """
     Helper function to create a quantization config from a dictionary.
@@ -1850,6 +1939,10 @@ def _quantization_config_from_dict(config_dict: Dict[str, Any]) -> OVQuantizatio
     # Check for OVPipelineQuantizationConfig
     if "quantization_configs" in config_dict:
         return OVPipelineQuantizationConfig.from_dict(config_dict)
+
+    # Check for a two-stage quantization config (generic or model-specific, e.g. Qwen4-Base)
+    if config_dict.get("config_class") in _TWO_STAGE_CONFIG_CLASSES:
+        return _TWO_STAGE_CONFIG_CLASSES[config_dict["config_class"]].from_dict(config_dict)
 
     # Check for GPT-OSS quantization config
     if "quantization_config1" in config_dict and "quantization_config2" in config_dict:
