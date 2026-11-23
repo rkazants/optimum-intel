@@ -56,7 +56,7 @@ from .configuration import (
     OVQuantizationMethod,
     OVWeightQuantizationConfig,
     _merge_ignored_scopes,
-    _TwoStageWeightQuantizationConfig,
+    _TwoStageQuantizationConfig,
 )
 from .modeling import OVModelForFeatureExtraction, OVModelForMaskedLM, OVModelForZeroShotImageClassification
 from .modeling_base import OVBaseModel
@@ -1504,12 +1504,10 @@ class OVQuantizer(OptimumQuantizer):
                 config = config.clone()
                 config.num_samples = nncf_dataset.get_length()
 
-            if isinstance(config, _TwoStageWeightQuantizationConfig):
+            if isinstance(config, _TwoStageQuantizationConfig):
                 first_stage = config.first_stage.clone()
                 first_stage.num_samples = config.num_samples
                 quantized_model = _weight_only_quantization(ov_model, first_stage, nncf_dataset, **kwargs)
-                # Constants added by the first stage are auto-named and can reuse names of the loaded model, which the
-                # second stage's graph building rejects
                 _make_node_names_unique(quantized_model)
                 quantized_model = _weight_only_quantization(
                     quantized_model, config.second_stage, verify_not_optimized=False, **kwargs
@@ -1749,17 +1747,17 @@ class OVQuantizer(OptimumQuantizer):
 
 
 def _make_node_names_unique(model: openvino.Model):
-    """Gives every node that repeats an earlier node's friendly name a fresh, unused name."""
+    # Constants added by a compression pass are auto-named and can reuse names of the loaded model, which the graph
+    # building of a following pass rejects
     names = {op.get_friendly_name() for op in model.get_ops()}
     seen = set()
     for op in model.get_ordered_ops():
-        name = op.get_friendly_name()
-        if name in seen:
-            index = 1
-            while f"{name}_{index}" in names:
-                index += 1
-            op.set_friendly_name(f"{name}_{index}")
-            names.add(f"{name}_{index}")
+        name, index = op.get_friendly_name(), 0
+        while op.get_friendly_name() in seen:
+            index += 1
+            if f"{name}_{index}" not in names:
+                op.set_friendly_name(f"{name}_{index}")
+                names.add(op.get_friendly_name())
         seen.add(op.get_friendly_name())
 
 
